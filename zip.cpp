@@ -26,7 +26,7 @@ std::vector<uint8_t> Zip::compress(const std::vector<uint8_t>& data, int level) 
     
     // 错误处理
     if (err != Z_OK) {
-        throw std::runtime_error("Compression failed: " + std::to_string(err));
+        throw std::runtime_error("Compression failed: " + std::string(zError(err)));
     }
     
     result.resize(compressedSize);
@@ -38,28 +38,32 @@ std::vector<uint8_t> Zip::decompress(const std::vector<uint8_t>& compressed) {
     if (compressed.empty()) return {};
     
     // 初始缓冲区大小
-    uLongf uncompressedSize = compressed.size() * 10;
+    size_t bufferSize = compressed.size() * 2;
     std::vector<uint8_t> result;
+    int err = Z_BUF_ERROR;
     
-    do {
-        result.resize(uncompressedSize);
-        int err = uncompress(result.data(), &uncompressedSize, 
-                            compressed.data(), compressed.size());
+    // 最多尝试5次
+    for (int i = 0; i < 5; ++i) {
+        result.resize(bufferSize);
+        uLongf destLen = static_cast<uLongf>(result.size());
+        
+        err = uncompress(result.data(), &destLen, 
+                        compressed.data(), compressed.size());
         
         if (err == Z_OK) {
-            result.resize(uncompressedSize);
+            result.resize(destLen);
             return result;
         }
         
         if (err != Z_BUF_ERROR) {
-            throw std::runtime_error("Decompression failed: " + std::to_string(err));
+            throw std::runtime_error("Decompression failed: " + std::string(zError(err)));
         }
         
-        // 缓冲区不足时加倍
-        uncompressedSize *= 2;
-    } while (uncompressedSize < 100 * 1024 * 1024); // 限制100MB
+        // 缓冲区不足时增加50%
+        bufferSize = bufferSize * 3 / 2;
+    }
     
-    throw std::runtime_error("Decompression failed: output data too large");
+    throw std::runtime_error("Decompression failed: output buffer too small after multiple attempts");
 }
 
 // 压缩字符串
@@ -71,7 +75,7 @@ std::vector<uint8_t> Zip::compressString(const std::string& str, int level) {
 // 解压字符串
 std::string Zip::decompressString(const std::vector<uint8_t>& compressed) {
     auto decompressed = decompress(compressed);
-    return std::string(decompressed.begin(), decompressed.end());
+    return std::string(reinterpret_cast<char*>(decompressed.data()), decompressed.size());
 }
 
 // 压缩文件
@@ -120,29 +124,42 @@ void Zip::decompressFile(const std::string& inputPath, const std::string& output
 void Zip::compressStream(std::istream& input, std::ostream& output, int level) {
     constexpr size_t CHUNK_SIZE = 64 * 1024; // 64KB
     std::vector<uint8_t> inBuf(CHUNK_SIZE);
-    std::vector<uint8_t> outBuf(CHUNK_SIZE * 2); // 压缩后可能更大
+    std::vector<uint8_t> outBuf(CHUNK_SIZE * 2);
     
     z_stream stream = {};
-    deflateInit2(&stream, level, Z_DEFLATED, MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+    if (deflateInit2(&stream, level, Z_DEFLATED, MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        throw std::runtime_error("deflateInit failed: " + std::string(zError(stream.avail_in)));
+    }
     
-    int flush;
-    do {
-        input.read(reinterpret_cast<char*>(inBuf.data()), CHUNK_SIZE);
-        stream.avail_in = static_cast<uInt>(input.gcount());
-        flush = input.eof() ? Z_FINISH : Z_NO_FLUSH;
-        stream.next_in = inBuf.data();
-        
+    auto cleanup = [&] { deflateEnd(&stream); };
+    
+    try {
+        int flush;
         do {
-            stream.avail_out = static_cast<uInt>(outBuf.size());
-            stream.next_out = outBuf.data();
-            deflate(&stream, flush);
+            input.read(reinterpret_cast<char*>(inBuf.data()), CHUNK_SIZE);
+            stream.avail_in = static_cast<uInt>(input.gcount());
+            flush = input.eof() ? Z_FINISH : Z_NO_FLUSH;
+            stream.next_in = inBuf.data();
             
-            size_t have = outBuf.size() - stream.avail_out;
-            output.write(reinterpret_cast<const char*>(outBuf.data()), have);
-        } while (stream.avail_out == 0);
-    } while (flush != Z_FINISH);
+            do {
+                stream.avail_out = static_cast<uInt>(outBuf.size());
+                stream.next_out = outBuf.data();
+                
+                int err = deflate(&stream, flush);
+                if (err == Z_STREAM_ERROR) {
+                    throw std::runtime_error("Compression error: " + std::string(zError(err)));
+                }
+                
+                size_t have = outBuf.size() - stream.avail_out;
+                output.write(reinterpret_cast<const char*>(outBuf.data()), have);
+            } while (stream.avail_out == 0);
+        } while (flush != Z_FINISH);
+    } catch (...) {
+        cleanup();
+        throw;
+    }
     
-    deflateEnd(&stream);
+    cleanup();
 }
 
 // 流式解压
@@ -152,37 +169,50 @@ void Zip::decompressStream(std::istream& input, std::ostream& output) {
     std::vector<uint8_t> outBuf(CHUNK_SIZE * 2);
     
     z_stream stream = {};
-    inflateInit2(&stream, MAX_WBITS);
+    if (inflateInit2(&stream, MAX_WBITS) != Z_OK) {
+        throw std::runtime_error("inflateInit failed: " + std::string(zError(stream.avail_in)));
+    }
     
-    int ret;
-    do {
-        input.read(reinterpret_cast<char*>(inBuf.data()), CHUNK_SIZE);
-        stream.avail_in = static_cast<uInt>(input.gcount());
-        if (stream.avail_in == 0) break;
-        stream.next_in = inBuf.data();
-        
+    auto cleanup = [&] { inflateEnd(&stream); };
+    
+    try {
+        int ret;
         do {
-            stream.avail_out = static_cast<uInt>(outBuf.size());
-            stream.next_out = outBuf.data();
-            ret = inflate(&stream, Z_NO_FLUSH);
+            input.read(reinterpret_cast<char*>(inBuf.data()), CHUNK_SIZE);
+            stream.avail_in = static_cast<uInt>(input.gcount());
+            if (stream.avail_in == 0) break;
+            stream.next_in = inBuf.data();
             
-            if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
-                inflateEnd(&stream);
-                throw std::runtime_error("Decompression error: " + std::to_string(ret));
-            }
-            
-            size_t have = outBuf.size() - stream.avail_out;
-            output.write(reinterpret_cast<const char*>(outBuf.data()), have);
-        } while (stream.avail_out == 0);
-    } while (ret != Z_STREAM_END);
+            do {
+                stream.avail_out = static_cast<uInt>(outBuf.size());
+                stream.next_out = outBuf.data();
+                ret = inflate(&stream, Z_NO_FLUSH);
+                
+                if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || 
+                    ret == Z_MEM_ERROR || ret == Z_STREAM_ERROR) {
+                    throw std::runtime_error("Decompression error: " + std::string(zError(ret)));
+                }
+                
+                size_t have = outBuf.size() - stream.avail_out;
+                output.write(reinterpret_cast<const char*>(outBuf.data()), have);
+            } while (stream.avail_out == 0);
+        } while (ret != Z_STREAM_END);
+        
+        if (ret != Z_STREAM_END) {
+            throw std::runtime_error("Decompression incomplete");
+        }
+    } catch (...) {
+        cleanup();
+        throw;
+    }
     
-    inflateEnd(&stream);
+    cleanup();
 }
 
-// 检查是否为ZIP格式
-bool Zip::isZipFormat(const std::vector<uint8_t>& data) {
+// 检查是否为zlib格式
+bool Zip::isZlibFormat(const std::vector<uint8_t>& data) {
     if (data.size() < 2) return false;
-    // 简单的魔法数字检查
+    // zlib魔法数字检查
     return (data[0] == 0x78 && (data[1] == 0x01 || data[1] == 0x5E || 
                                 data[1] == 0x9C || data[1] == 0xDA));
 }
